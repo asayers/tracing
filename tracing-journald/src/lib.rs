@@ -38,7 +38,7 @@
 #![cfg_attr(docsrs, deny(rustdoc::broken_intra_doc_links))]
 #[cfg(unix)]
 use std::os::unix::net::UnixDatagram;
-use std::{fmt, io, io::Write};
+use std::{fmt, io, io::Write, os::fd::AsRawFd};
 
 use tracing_core::{
     event::Event,
@@ -187,7 +187,6 @@ impl Layer {
     fn send_large_payload(&self, payload: &[u8]) -> io::Result<usize> {
         // If the payload's too large for a single datagram, send it through a memfd, see
         // https://systemd.io/JOURNAL_NATIVE_PROTOCOL/
-        use std::os::unix::prelude::AsRawFd;
         // Write the whole payload to a memfd
         let mut mem = memfd::create_sealable()?;
         mem.write_all(payload)?;
@@ -423,4 +422,42 @@ fn put_value(buf: &mut Vec<u8>, value: &[u8]) {
     buf.extend_from_slice(&(value.len() as u64).to_le_bytes());
     buf.extend_from_slice(value);
     buf.push(b'\n');
+}
+
+/// Detects whether stderr is connected to the journal
+///
+/// If this function returns `true`, there's no reason not to upgrade to
+/// journald's native logging protocol.
+///
+/// See <https://systemd.io/JOURNAL_NATIVE_PROTOCOL/#automatic-protocol-upgrading>
+/// for details of how this works.
+pub fn is_stderr_connected_to_journald() -> std::io::Result<bool> {
+    let Ok(x) = std::env::var("JOURNAL_STREAM") else {
+        return Ok(false);
+    };
+    // The systemd service logic sets $JOURNAL_STREAM to a colon-separated pair
+    // of device and inode number (formatted in decimal ASCII)
+    let (device, inode) = x
+        .split_once(':')
+        .ok_or_else(|| std::io::Error::other("JOURNAL_STREAM wasn't a colon-separated pair"))?;
+    let device = device.parse::<u64>().map_err(std::io::Error::other)?;
+    let inode = inode.parse::<u64>().map_err(std::io::Error::other)?;
+    // If the `st_dev` and `st_ino` fields returned by `fstat(stderr)` match
+    // these values then a program can be sure its stderr is connected to the
+    // journal
+    let stat = stat(std::io::stderr())?;
+    Ok(stat.st_dev == device && stat.st_ino == inode)
+}
+
+fn stat(fd: impl AsRawFd) -> std::io::Result<libc::stat> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `stat` has the expected size because we just allocated it
+    let ret = unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) };
+    if ret == 0 {
+        // SAFETY: `stat` is initialized because we just called `fstat()` on it,
+        // and `fstat()` returned successfully
+        Ok(unsafe { stat.assume_init() })
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
